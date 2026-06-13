@@ -1,0 +1,2 @@
+Dataset,Total_Records,Joyful_Records,Sad_Records,Joyful_Percentage,Sad_Percentage,Average_Text_Length,Median_Text_Length,Min_Text_Length,Max_Text_Length,Unique_Conversations
+Empathetic Dialogues (ED),1627,770,857,47.32636754763368,52.67363245236631,281.01106330669944,255.0,58,2010,1627
