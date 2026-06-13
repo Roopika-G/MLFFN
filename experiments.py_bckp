@@ -1,0 +1,146 @@
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Reduce TensorFlow logging
+os.environ['OMP_NUM_THREADS'] = '1'       # Limit OpenMP threads
+os.environ['MKL_NUM_THREADS'] = '1'       # Limit MKL threads
+
+import tensorflow as tf
+tf.config.set_visible_devices([], 'GPU')  # Disable GPU - Force CPU-only mode
+tf.config.threading.set_intra_op_parallelism_threads(1)
+tf.config.threading.set_inter_op_parallelism_threads(1)
+
+
+import pandas as pd
+import os
+import util
+import modeling.feature_extraction as fe
+from modeling import common
+from sklearn.model_selection import KFold
+import numpy as np
+import keras
+from sklearn.linear_model import RidgeCV
+
+# Load conversations dataset (preprocessed)
+train, dev, test = util.train_dev_test_split(util.get_conversations())
+# Combine train + test for cross-validation (dev left out)
+data = pd.concat([train, test], axis=0).reset_index(drop=True)
+
+# Load embeddings (FastText common crawl)
+embs = common.get_facebook_fasttext_common_crawl(vocab_limit=None)
+
+# Define features Change data.conversations to data.text or input accordingly
+FEATURES_MATRIX = fe.embedding_matrix(data.conversation, embs, common.TIMESTEPS)
+FEATURES_CENTROID = fe.embedding_centroid(data.conversation, embs)
+
+#FEATURES_MATRIX = fe.embedding_matrix(data.conversation, embs, common.TIMESTEPS)
+#FEATURES_CENTROID = fe.embedding_centroid(data.conversation, embs)
+
+# Define models (CNN, FFN, Ridge)
+MODELS = {
+    "cnn": lambda: common.get_cnn(
+        input_shape=[common.TIMESTEPS, 300],
+        num_outputs=1,
+        num_filters=100,
+        learning_rate=1e-3, #original
+        #learning_rate=5e-4,#hypermater tuning for overfitting
+        dropout_conv=.5,
+        problem="classification"
+    ),
+    "ffn": lambda: common.get_ffn(
+        units=[300, 256, 128, 1],
+        dropout_hidden=.5, #original
+        dropout_embedding=.2, #original
+        #dropout_hidden=.8, #hypermater tuning for overfitting
+        #dropout_embedding=.5, #hypermater tuning for overfitting
+        learning_rate=1e-3, #original
+        #learning_rate=5e-4, #hypermater tuning for overfitting
+        problem="classification"
+    ),
+    "ridge": lambda: RidgeCV(alphas=[1, 0.5, 0.1, 0.01])
+}
+
+# Early stopping callback to avoid overfitting
+early_stopping = keras.callbacks.EarlyStopping(
+    monitor="val_loss", patience=20, verbose=1, mode="auto" #original
+    #monitor="val_loss", patience=2, verbose=1, mode="auto" #hypermater tuning for overfitting
+)
+
+# Create binary labels: Joyful=1, Sad=0 for ED dataset
+#data["emotion_bin"] = (data["emotion"] == "joyful").astype(int)
+
+# Run 5-fold cross-validation
+kf_iterator = KFold(n_splits=5, shuffle=True, random_state=42)
+
+# Initialize results storage
+results = {"cnn": [], "ffn": [], "ridge": []}
+
+for i, (train_idx, test_idx) in enumerate(kf_iterator.split(data)):
+    # Split labels Change data["emotion_bin" to data["labels"] or input accordingly
+    #train_labels = data["emotion_bin"].iloc[train_idx]
+    #test_labels = data["emotion_bin"].iloc[test_idx]
+    #train_labels = data["label"].iloc[train_idx]
+    #test_labels = data["label"].iloc[test_idx]
+    train_labels = data["emotion"].iloc[train_idx]
+    test_labels = data["emotion"].iloc[test_idx]
+
+    # Split features
+    train_features_centroid = FEATURES_CENTROID[train_idx]
+    train_features_matrix = FEATURES_MATRIX[train_idx]
+    test_features_centroid = FEATURES_CENTROID[test_idx]
+    test_features_matrix = FEATURES_MATRIX[test_idx]
+
+    # Loop over models
+    for name, model_fun in MODELS.items():
+        model = model_fun()
+        if name == "cnn":
+            # CNN uses embedding matrix (sequence features)
+            model.fit(train_features_matrix, train_labels,
+                      validation_split=.1, epochs=50, batch_size=32, #original
+                      #validation_split=.3, epochs=20, batch_size=64, #hypermater tuning for overfitting
+                      callbacks=[early_stopping])
+            preds = model.predict(test_features_matrix)
+        elif name == "ffn":
+            # FFN uses centroid features (averaged embeddings)
+            model.fit(train_features_centroid, train_labels,
+                      validation_split=.1, epochs=50, batch_size=32, #original
+                      #validation_split=.3, epochs=20, batch_size=64, #hypermater tuning for overfitting
+                      callbacks=[early_stopping])
+            preds = model.predict(test_features_centroid)
+            # Save FFN weights for lexicon generation later
+            if not os.path.exists("results"):
+                os.makedirs("results")
+            model.save_weights("results/ffn_model.weights.h5")
+        else:
+            # Ridge regression also uses centroid features
+            model.fit(train_features_centroid, train_labels)
+            preds = model.predict(test_features_centroid)
+            # Save Ridge model for lexicon generation
+            if not os.path.exists("results"):
+                os.makedirs("results")
+            import joblib
+            joblib.dump(model, "results/ridge_model.pkl")
+
+        # Calculate accuracy for current fold + model
+        accuracy = np.mean((preds.flatten() > 0.5) == test_labels)
+        results[name].append(accuracy)
+        print(f"Fold {i+1}, {name}, accuracy: {accuracy:.4f}")
+
+# Save results to TSV files for ttest analysis
+if not os.path.exists("results"):
+    os.makedirs("results")
+
+for model_name, accuracies in results.items():
+    df_results = pd.DataFrame({"fold": range(1, 6), "accuracy": accuracies})
+    df_results.to_csv(f"results/{model_name}.tsv", sep='\t', index=False)
+    print(f"✅ Saved {model_name} results to results/{model_name}.tsv")
+
+print("\n📊 Cross-validation summary:")
+for model_name, accuracies in results.items():
+    mean_acc = np.mean(accuracies)
+    std_acc = np.std(accuracies)
+    print(f"{model_name.upper()}: {mean_acc:.4f} ± {std_acc:.4f}")
+
+# Cleanup TensorFlow session
+import gc
+tf.keras.backend.clear_session()
+gc.collect()
+print("\n🧹 Cleaned up TensorFlow session")
